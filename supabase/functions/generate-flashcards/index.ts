@@ -7,7 +7,7 @@ const corsHeaders = {
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
 };
 
-const GEMINI_API_KEY = Deno.env.get('GEMINI_API_KEY');
+const LOVABLE_API_KEY = Deno.env.get('LOVABLE_API_KEY');
 
 serve(async (req) => {
   if (req.method === 'OPTIONS') {
@@ -27,7 +27,7 @@ serve(async (req) => {
 
     const token = authHeader.replace('Bearer ', '');
     const { data: { user }, error: userError } = await supabase.auth.getUser(token);
-    
+
     if (userError || !user) {
       throw new Error('Invalid token');
     }
@@ -36,6 +36,10 @@ serve(async (req) => {
 
     if (!courseId) {
       throw new Error('courseId is required');
+    }
+
+    if (!LOVABLE_API_KEY) {
+      throw new Error('LOVABLE_API_KEY is not configured');
     }
 
     // Verify user owns the course and get chunks
@@ -66,57 +70,108 @@ serve(async (req) => {
 
     const allText = chunks.map(c => c.text).join('\n\n');
 
-    const systemPrompt = `Scan the following document for complex terminology, definitions, key concepts, important facts, and formulas. Generate 10-15 flashcards for revision.
+    const systemPrompt = `Create flashcards strictly from the provided document text. Use the tool schema exactly.\n\nRules:\n- Generate 10 to 15 flashcards.\n- Focus on key terms, definitions, important concepts, dates, and formulas.\n- Keep front concise; back clear and complete but not too long.\n- Do not add information not found in the document.`;
 
-Output JSON exactly in this format (no extra text):
-{
-  "flashcards": [
-    { "front": "<term or question>", "back": "<definition or answer>" },
-    ...
-  ]
-}
+    const userPrompt = `Document:\n${allText}`;
 
-Rules:
-- Focus on key terms, definitions, important concepts, dates, formulas
-- Keep front (question) concise
-- Keep back (answer) clear and complete but not too long
-- All content must come from the provided text only
+    const body: any = {
+      model: 'google/gemini-2.5-flash',
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userPrompt },
+      ],
+      tools: [
+        {
+          type: 'function',
+          function: {
+            name: 'create_flashcards',
+            description: 'Generate 10-15 flashcards from the document.',
+            parameters: {
+              type: 'object',
+              additionalProperties: false,
+              required: ['flashcards'],
+              properties: {
+                flashcards: {
+                  type: 'array',
+                  minItems: 10,
+                  maxItems: 15,
+                  items: {
+                    type: 'object',
+                    additionalProperties: false,
+                    required: ['front', 'back'],
+                    properties: {
+                      front: { type: 'string' },
+                      back: { type: 'string' },
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
+      ],
+      tool_choice: { type: 'function', function: { name: 'create_flashcards' } },
+    };
 
-Document:
-${allText}`;
+    let retries = 0;
+    let flashcardsData: any = null;
 
-    const response = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`,
-      {
+    while (retries < 3 && !flashcardsData) {
+      const response = await fetch('https://ai.gateway.lovable.dev/v1/chat/completions', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          contents: [{ parts: [{ text: systemPrompt }] }],
-          generationConfig: {
-            temperature: 0.4,
-            maxOutputTokens: 4096
+        headers: {
+          Authorization: `Bearer ${LOVABLE_API_KEY}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(body),
+      });
+
+      if (!response.ok) {
+        const t = await response.text();
+        console.error('AI gateway error:', response.status, t);
+
+        if (response.status === 429) {
+          return new Response(JSON.stringify({ error: 'Rate limit exceeded. Please try again in a moment.' }), {
+            status: 429,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
+        }
+
+        if (response.status === 402) {
+          return new Response(JSON.stringify({ error: 'AI credits depleted. Please add credits to continue.' }), {
+            status: 402,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
+        }
+
+        throw new Error(`AI generation failed: ${t}`);
+      }
+
+      const data = await response.json();
+      const toolCall = data?.choices?.[0]?.message?.tool_calls?.[0];
+
+      try {
+        if (toolCall?.function?.arguments) {
+          const parsed = JSON.parse(toolCall.function.arguments);
+
+          if (Array.isArray(parsed?.flashcards) && parsed.flashcards.length >= 10 && parsed.flashcards.length <= 15) {
+            flashcardsData = parsed;
+            break;
           }
-        })
-      }
-    );
+        }
 
-    if (!response.ok) {
-      throw new Error(`Gemini generation failed: ${await response.text()}`);
+        console.log('Invalid flashcards tool output, retrying...');
+        retries++;
+      } catch (e) {
+        console.error('Failed to parse tool arguments:', e);
+        retries++;
+      }
     }
 
-    const data = await response.json();
-    const responseText = data.candidates[0].content.parts[0].text;
-
-    let flashcardsData = { flashcards: [] };
-    try {
-      const jsonMatch = responseText.match(/\{[\s\S]*\}/);
-      if (jsonMatch) {
-        flashcardsData = JSON.parse(jsonMatch[0]);
-      }
-    } catch (e) {
-      console.error('Failed to parse flashcards JSON:', e);
-      throw new Error('Failed to generate valid flashcards');
+    if (!flashcardsData) {
+      throw new Error('Failed to generate valid flashcards after 3 attempts');
     }
+
 
     // Delete existing flashcards for this course
     await supabase
