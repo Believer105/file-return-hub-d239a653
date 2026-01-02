@@ -7,7 +7,7 @@ const corsHeaders = {
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
 };
 
-const GEMINI_API_KEY = Deno.env.get('GEMINI_API_KEY');
+const LOVABLE_API_KEY = Deno.env.get('LOVABLE_API_KEY');
 
 serve(async (req) => {
   if (req.method === 'OPTIONS') {
@@ -27,7 +27,7 @@ serve(async (req) => {
 
     const token = authHeader.replace('Bearer ', '');
     const { data: { user }, error: userError } = await supabase.auth.getUser(token);
-    
+
     if (userError || !user) {
       throw new Error('Invalid token');
     }
@@ -36,6 +36,10 @@ serve(async (req) => {
 
     if (!courseId) {
       throw new Error('courseId is required');
+    }
+
+    if (!LOVABLE_API_KEY) {
+      throw new Error('LOVABLE_API_KEY is not configured');
     }
 
     // Verify user owns the course and get chunks
@@ -72,57 +76,113 @@ serve(async (req) => {
       long: 'Be comprehensive with 8-12 bullet points per section.'
     };
 
-    const systemPrompt = `Generate a "Cheat Sheet" summary of the following document. Break it down into structured sections.
+    const systemPrompt = `Generate a "Cheat Sheet" summary of the provided document. Use the tool schema exactly.\n\nRules:\n- coreConcepts: Main ideas, theories, or principles\n- keyFacts: Important dates, formulas, statistics, definitions\n- actionSteps: Practical applications or things to remember for exams\n- ${lengthInstructions[length as keyof typeof lengthInstructions] || lengthInstructions.medium}\n- All content must come from the document only.`;
 
-Output JSON exactly in this format (no extra text):
-{
-  "coreConcepts": ["<concept 1>", "<concept 2>", ...],
-  "keyFacts": ["<fact/date/formula 1>", "<fact/date/formula 2>", ...],
-  "actionSteps": ["<actionable step 1>", "<actionable step 2>", ...]
-}
+    const userPrompt = `Document:\n${allText}`;
 
-Rules:
-- coreConcepts: Main ideas, theories, or principles
-- keyFacts: Important dates, formulas, statistics, definitions
-- actionSteps: Practical applications or things to remember for exams
-- ${lengthInstructions[length as keyof typeof lengthInstructions] || lengthInstructions.medium}
-- All content must come from the provided text only
+    const body: any = {
+      model: 'google/gemini-2.5-flash',
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userPrompt },
+      ],
+      tools: [
+        {
+          type: 'function',
+          function: {
+            name: 'create_summary',
+            description: 'Create a cheat-sheet summary with core concepts, key facts, and action steps.',
+            parameters: {
+              type: 'object',
+              additionalProperties: false,
+              required: ['coreConcepts', 'keyFacts', 'actionSteps'],
+              properties: {
+                coreConcepts: {
+                  type: 'array',
+                  items: { type: 'string' },
+                  minItems: 3,
+                },
+                keyFacts: {
+                  type: 'array',
+                  items: { type: 'string' },
+                  minItems: 3,
+                },
+                actionSteps: {
+                  type: 'array',
+                  items: { type: 'string' },
+                  minItems: 2,
+                },
+              },
+            },
+          },
+        },
+      ],
+      tool_choice: { type: 'function', function: { name: 'create_summary' } },
+    };
 
-Document:
-${allText}`;
+    let retries = 0;
+    let summaryData: any = null;
 
-    const response = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`,
-      {
+    while (retries < 3 && !summaryData) {
+      const response = await fetch('https://ai.gateway.lovable.dev/v1/chat/completions', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          contents: [{ parts: [{ text: systemPrompt }] }],
-          generationConfig: {
-            temperature: 0.4,
-            maxOutputTokens: 4096
+        headers: {
+          Authorization: `Bearer ${LOVABLE_API_KEY}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(body),
+      });
+
+      if (!response.ok) {
+        const t = await response.text();
+        console.error('AI gateway error:', response.status, t);
+
+        if (response.status === 429) {
+          return new Response(JSON.stringify({ error: 'Rate limit exceeded. Please try again in a moment.' }), {
+            status: 429,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
+        }
+
+        if (response.status === 402) {
+          return new Response(JSON.stringify({ error: 'AI credits depleted. Please add credits to continue.' }), {
+            status: 402,
+            headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          });
+        }
+
+        throw new Error(`AI generation failed: ${t}`);
+      }
+
+      const data = await response.json();
+      const toolCall = data?.choices?.[0]?.message?.tool_calls?.[0];
+
+      try {
+        if (toolCall?.function?.arguments) {
+          const parsed = JSON.parse(toolCall.function.arguments);
+
+          if (
+            Array.isArray(parsed?.coreConcepts) && parsed.coreConcepts.length >= 3 &&
+            Array.isArray(parsed?.keyFacts) && parsed.keyFacts.length >= 3 &&
+            Array.isArray(parsed?.actionSteps) && parsed.actionSteps.length >= 2
+          ) {
+            summaryData = parsed;
+            break;
           }
-        })
-      }
-    );
+        }
 
-    if (!response.ok) {
-      throw new Error(`Gemini generation failed: ${await response.text()}`);
+        console.log('Invalid summary tool output, retrying...');
+        retries++;
+      } catch (e) {
+        console.error('Failed to parse tool arguments:', e);
+        retries++;
+      }
     }
 
-    const data = await response.json();
-    const responseText = data.candidates[0].content.parts[0].text;
-
-    let summaryData = { coreConcepts: [], keyFacts: [], actionSteps: [] };
-    try {
-      const jsonMatch = responseText.match(/\{[\s\S]*\}/);
-      if (jsonMatch) {
-        summaryData = JSON.parse(jsonMatch[0]);
-      }
-    } catch (e) {
-      console.error('Failed to parse summary JSON:', e);
-      throw new Error('Failed to generate valid summary');
+    if (!summaryData) {
+      throw new Error('Failed to generate valid summary after 3 attempts');
     }
+
 
     // Store summary
     const { data: savedSummary, error: saveError } = await supabase
